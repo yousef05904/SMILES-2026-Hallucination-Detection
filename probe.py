@@ -13,24 +13,63 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 
 
 RNG_SEED = 42
+GEOMETRIC_FEATURE_DIM = 32
 
 
-def _build_estimator() -> Pipeline:
+def _safe_pca_dim(n_samples: int, n_features: int) -> int:
+    semantic_dim = max(1, n_features - GEOMETRIC_FEATURE_DIM)
+    return int(max(1, min(48, semantic_dim, n_samples - 1)))
+
+
+def _build_estimator(n_samples: int, n_features: int) -> Pipeline:
+    pca_dim = _safe_pca_dim(n_samples, n_features)
+
     return Pipeline(
         [
-            ("scaler", StandardScaler()),
+            (
+                "features",
+                ColumnTransformer(
+                    transformers=[
+                        (
+                            "geom",
+                            RobustScaler(),
+                            slice(0, min(GEOMETRIC_FEATURE_DIM, n_features)),
+                        ),
+                        (
+                            "semantic",
+                            Pipeline(
+                                [
+                                    ("scaler", StandardScaler()),
+                                    (
+                                        "pca",
+                                        PCA(
+                                            n_components=pca_dim,
+                                            svd_solver="randomized",
+                                            random_state=RNG_SEED,
+                                        ),
+                                    ),
+                                ]
+                            ),
+                            slice(min(GEOMETRIC_FEATURE_DIM, n_features), n_features),
+                        ),
+                    ],
+                    remainder="drop",
+                ),
+            ),
             (
                 "lr",
                 LogisticRegression(
                     solver="lbfgs",
-                    C=0.2,
+                    C=0.6,
                     max_iter=3000,
                     class_weight="balanced",
                     random_state=RNG_SEED,
@@ -58,7 +97,7 @@ class HallucinationProbe(nn.Module):
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.int64)
 
-        self._model = _build_estimator()
+        self._model = _build_estimator(X.shape[0], X.shape[1])
         self._model.fit(X, y)
         return self
 
