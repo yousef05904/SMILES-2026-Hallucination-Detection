@@ -60,9 +60,9 @@ Files modified (`aggregation.py`): look for **`_stub_model_maybe`** and **`SMILE
 
 | File | Role |
 |------|------|
-| `aggregation.py` | Balanced late-layer features: last 4 transformer layers, each with masked mean pooling plus the last valid token representation (`feature_dim ≈ 7,168` for Qwen-0.5B). Optional `SMILES_STUB_LM`. |
-| `probe.py` | `HallucinationProbe` subclasses `torch.nn.Module` per harness but delegates to a deterministic **sklearn** pipeline: `StandardScaler` → `PCA` → balanced `LogisticRegression`. Validation accuracy, with F1 as tie-breaker, selects the inference threshold (`fit_hyperparameters`). |
-| `splitting.py` | **Stratified 5-fold** outer evaluation; deterministic stratified validation folds for threshold tuning, with prompt grouping only when it remains fold-stable. |
+| `aggregation.py` | Minimal clean features: selected mid-late transformer layers `[-8, -4, -1]`, each with masked mean pooling only (`feature_dim ≈ 2,688` for Qwen-0.5B). Optional `SMILES_STUB_LM`. |
+| `probe.py` | `HallucinationProbe` subclasses `torch.nn.Module` per harness but delegates to a deterministic **sklearn** pipeline: `StandardScaler` → balanced `LogisticRegression`. Validation accuracy, with F1 and prediction balance as tie-breakers, selects the inference threshold (`fit_hyperparameters`). |
+| `splitting.py` | **Stratified 5-fold** outer evaluation; deterministic stratified validation slice from the outer training pool for threshold tuning. |
 
 Infrastructure left unchanged: **`model.py`**, **`evaluate.py`**, **`solution.py`**, data.
 
@@ -72,28 +72,26 @@ Infrastructure left unchanged: **`model.py`**, **`evaluate.py`**, **`solution.py
 
 ### Aggregation
 
-The final extractor uses the **four deepest transformer stacks** (`-4...-1`). For each selected layer it concatenates:
+The final extractor uses three selected transformer stacks: **`-8`**, **`-4`**, and **`-1`**. For each selected layer it uses:
 
 - masked mean pooling over valid, non-padding tokens
-- the last valid token representation
 
-It deliberately excludes max pooling, std pooling, cosine chains, norm ratios, length cues, and large geometric expansion. Padding is stripped with the attention mask moved to the hidden-state device, so the same code path works on CPU, CUDA, and Colab GPU.
+It deliberately excludes last-token concatenation, max pooling, std pooling, cosine chains, norm ratios, length cues, and large geometric expansion. Padding is stripped with the attention mask moved to the hidden-state device, so the same code path works on CPU, CUDA, and Colab GPU.
 
-Motivation: Version A (`feature_dim = 12,554`) had useful late-layer signal but overfit. Version B (`feature_dim = 2,688`) removed too much signal and underfit. The final design keeps answer-ending signal plus global answer/context signal from late layers while staying materially smaller than the overfit version.
+Motivation: huge feature versions (`feature_dim = 12,554...17,943`) overfit or underperformed, while a last-three-layer mean-only variant was too weak in our run. The selected-layer version keeps the feature count low (`2,688`) but samples a wider mid-late model trajectory instead of using only adjacent final layers.
 
 ### Probe
 
 The probe is a single regularized sklearn pipeline:
 
 - `StandardScaler`
-- randomized `PCA`, capped at `min(256, n_samples - 1, n_features)`
-- `LogisticRegression(lbfgs, C=0.5, class_weight="balanced")`
+- `LogisticRegression(lbfgs, C=0.2, class_weight="balanced")`
 
-Why not a larger ensemble? The real run showed a high-capacity feature/probe combination can memorize the folds. A single PCA logistic model keeps enough rank for the restored 7k-dimensional features while regularizing the final decision boundary.
+Why not PCA or a larger ensemble? At `2,688` dimensions, the feature space is small enough for a directly regularized linear probe. Avoiding PCA preserves the selected layer coordinates, while the stronger L2 penalty keeps train accuracy from drifting toward memorization.
 
 ### Splitting
 
-Stratified K-fold aligns with the leaderboard’s reliance on estimating generalization variance under class skew. Nested validation shards avoid peeking calibration thresholds from the locked-out fold test mass. Prompt-level grouping is used only when repeated prompts are sufficiently numerous and balanced; otherwise the splitter falls back to normal `StratifiedKFold` to avoid unstable validation/test class balance.
+Stratified K-fold aligns with the leaderboard’s reliance on estimating generalization variance under class skew. The validation shard is carved only from the corresponding outer training pool, so the outer test fold is never used for fitting or threshold calibration.
 
 ---
 
@@ -102,14 +100,15 @@ Stratified K-fold aligns with the leaderboard’s reliance on estimating general
 | Idea | Outcome |
 |------|---------|
 | Large pooled/geometric feature set (`feature_dim = 12,554`) | Real Colab run produced high train metrics but weaker validation/test metrics, indicating overfitting. |
-| Mean-only compact extractor (`feature_dim = 2,688`) | Real Colab run underfit and lost too much discriminative signal. |
-| Heavy ensemble probe | Avoided in the final version because the dataset is small and the goal is stable generalization rather than train accuracy. |
+| Even larger feature variants (`feature_dim ≈ 17,943`) | Added complexity without reliable generalization gains. |
+| Adjacent last-three-layer mean extractor (`feature_dim = 2,688`) | Real Colab run underfit in our implementation, so the final version keeps the same dimensionality but spreads layers across `-8`, `-4`, and `-1`. |
+| Heavy ensemble or tree probes | Avoided in the final version because the dataset is small and the goal is stable 5-fold generalization rather than train accuracy. |
 
 ---
 
 ## Metrics (official harness)
 
-Interpret **primary competition accuracy** via your own **`results.json`** `avg_test_accuracy` after **full** LM extraction ( **`SMILES_STUB_LM` unset** ). Final balanced-method metrics should be filled in only after the real Colab GPU run.
+Interpret **primary competition accuracy** via your own **`results.json`** `avg_test_accuracy` after **full** LM extraction ( **`SMILES_STUB_LM` unset** ). Final minimal-clean metrics should be filled in only after the real Colab GPU run.
 
 Representative **`evaluate.py`** fields I track during development:
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.pipeline import Pipeline
@@ -23,30 +22,15 @@ from sklearn.preprocessing import StandardScaler
 RNG_SEED = 42
 
 
-def _safe_pca_dim(n_samples: int, n_features: int) -> int:
-    """Keep enough principal components while staying inside fold rank."""
-    upper = min(n_features, max(1, n_samples - 1))
-    target = min(256, upper)
-    return int(max(1, target))
-
-
-def _build_estimator(n_samples: int, n_features: int) -> Pipeline:
+def _build_estimator() -> Pipeline:
     return Pipeline(
         [
             ("scaler", StandardScaler()),
             (
-                "pca",
-                PCA(
-                    n_components=_safe_pca_dim(n_samples, n_features),
-                    svd_solver="randomized",
-                    random_state=RNG_SEED,
-                ),
-            ),
-            (
                 "lr",
                 LogisticRegression(
                     solver="lbfgs",
-                    C=0.5,
+                    C=0.2,
                     max_iter=3000,
                     class_weight="balanced",
                     random_state=RNG_SEED,
@@ -74,7 +58,7 @@ class HallucinationProbe(nn.Module):
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.int64)
 
-        self._model = _build_estimator(X.shape[0], X.shape[1])
+        self._model = _build_estimator()
         self._model.fit(X, y)
         return self
 
@@ -90,12 +74,16 @@ class HallucinationProbe(nn.Module):
         candidates = np.linspace(0.25, 0.75, 101)
 
         best_threshold = 0.5
-        best_key = (-1.0, -1.0, -abs(best_threshold - 0.5))
+        best_key = (-1.0, -1.0, -1.0, -abs(best_threshold - 0.5))
         for t in candidates:
             y_pred_t = (probs >= t).astype(int)
+            positive_rate = float(y_pred_t.mean())
+            if positive_rate < 0.10 or positive_rate > 0.90:
+                continue
             acc = accuracy_score(y_val, y_pred_t)
             f1 = f1_score(y_val, y_pred_t, zero_division=0)
-            key = (acc, f1, -abs(float(t) - 0.5))
+            balance_score = -abs(positive_rate - float(y_val.mean()))
+            key = (acc, f1, balance_score, -abs(float(t) - 0.5))
             if key > best_key:
                 best_key = key
                 best_threshold = float(t)
