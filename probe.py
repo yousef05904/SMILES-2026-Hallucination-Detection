@@ -70,7 +70,7 @@ def _build_estimator(n_samples: int, n_features: int) -> Pipeline:
                 "lr",
                 LogisticRegression(
                     solver="lbfgs",
-                    C=0.03,
+                    C=0.07,
                     max_iter=3000,
                     random_state=RNG_SEED,
                 ),
@@ -115,7 +115,7 @@ class HallucinationProbe(nn.Module):
         for t in candidates:
             y_pred_t = (probs >= t).astype(int)
             positive_rate = float(y_pred_t.mean())
-            if positive_rate < 0.05 or positive_rate > 0.95:
+            if positive_rate < 0.10 or positive_rate > 0.90:
                 continue
             acc = accuracy_score(y_true, y_pred_t)
             f1 = f1_score(y_true, y_pred_t, zero_division=0)
@@ -138,7 +138,7 @@ class HallucinationProbe(nn.Module):
         if can_calibrate:
             idx_fit, idx_cal = train_test_split(
                 indices,
-                test_size=0.18,
+                test_size=0.12,
                 stratify=y,
                 random_state=RNG_SEED,
             )

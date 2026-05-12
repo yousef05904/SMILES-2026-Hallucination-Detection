@@ -60,7 +60,7 @@ Files modified (`aggregation.py`): look for **`_stub_model_maybe`** and **`SMILE
 
 | File | Role |
 |------|------|
-| `aggregation.py` | Compact hybrid features from layers `10-19`: 66 geometric/statistical trajectory scalars plus two 896-d semantic response-tail vectors (`feature_dim ≈ 1,858` for Qwen-0.5B). Optional `SMILES_STUB_LM`. |
+| `aggregation.py` | Compact response-only hybrid features from layers `10-19`: 66 geometric/statistical trajectory scalars plus two 896-d factual-layer semantic vectors (`feature_dim ≈ 1,858` for Qwen-0.5B). Optional `SMILES_STUB_LM`. |
 | `probe.py` | `HallucinationProbe` subclasses `torch.nn.Module` per harness but delegates to a deterministic block-wise **sklearn** pipeline: robust-scaled geometry, standardized semantic PCA, Platt-calibrated logistic regression, and validation accuracy threshold tuning. |
 | `splitting.py` | **Stratified 5-fold** outer evaluation; deterministic stratified validation slice from the outer training pool for threshold tuning. |
 
@@ -72,12 +72,12 @@ Infrastructure left unchanged: **`model.py`**, **`evaluate.py`**, **`solution.py
 
 ### Aggregation
 
-The final extractor uses only middle-to-late transformer layers in the **`10-19`** range.
+The final extractor uses only middle-to-late transformer layers in the **`10-19`** range. Since the fixed `solution.py` interface passes hidden states and attention masks rather than token IDs, response isolation is implemented as a deterministic hidden-state change-point suffix mask. All pooling and geometric statistics are then computed only on that estimated assistant-response span.
 
 It builds two compact blocks:
 
-- **Geometric block (`66` dims):** response/context norm statistics, response-context cosine contrast, inter-layer cosine trajectory, drift magnitudes, response length signals, and small trajectory-stability summaries.
-- **Semantic block (`1,792` dims):** response-tail mean pooling from layer `19` plus a max-fused layer `16/19` representation.
+- **Geometric block (`66` dims):** response/context norm statistics, response-context cosine contrast, inter-layer cosine trajectory, drift magnitudes, response length signals, boundary strength, and small trajectory-stability summaries.
+- **Semantic block (`1,792` dims):** response-only mean pooling from factual layers `12` and `13`.
 
 It deliberately excludes large hidden-state concatenations, max/std raw expansion, topological features, tree-style hand-crafted grids, and heavy last-token pooling. Padding is stripped with the attention mask moved to the hidden-state device, so the same code path works on CPU, CUDA, and Colab GPU.
 
@@ -89,7 +89,7 @@ The probe is a single regularized sklearn pipeline:
 
 - geometry: `RobustScaler`
 - semantic vectors: `StandardScaler` then randomized `PCA(n_components=48)`
-- classifier: `LogisticRegression(lbfgs, C=0.03)` without class weighting
+- classifier: `LogisticRegression(lbfgs, C=0.07)` without class weighting
 - calibration: internal Platt scaling split inside `fit()`
 - thresholding: validation accuracy first, F1 and prediction balance as tie-breakers
 

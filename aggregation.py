@@ -151,18 +151,66 @@ def _layer(h: torch.Tensor, layer_idx: int) -> torch.Tensor:
     return h[min(layer_idx, h.size(0) - 1)]
 
 
-def _response_and_context_masks(mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Approximate response tokens as the final valid span of the sequence."""
+def _response_and_context_masks(
+    h: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Estimate the assistant response as a final hidden-state change-point span.
+
+    ``solution.py`` passes hidden states and attention masks, not token IDs or raw
+    text.  This keeps the extractor compatible with that fixed interface while
+    avoiding full-sequence pooling: it searches the latter valid tokens for a
+    strong mid-layer transition and treats the suffix after that boundary as the
+    response segment.
+    """
     valid_positions = torch.nonzero(mask, as_tuple=False).squeeze(-1)
     n_valid = int(valid_positions.numel())
-    tail_len = max(1, min(n_valid, int(round(n_valid * 0.40))))
-    tail_start = valid_positions[-tail_len]
+    if n_valid <= 3:
+        response_mask = mask.clone()
+        return response_mask, response_mask, torch.zeros(1, dtype=h.dtype, device=h.device)
+
+    min_resp = max(2, int(round(n_valid * 0.12)))
+    max_resp = max(min_resp, int(round(n_valid * 0.70)))
+    max_resp = min(max_resp, n_valid - 1)
+
+    first_candidate = max(1, n_valid - max_resp)
+    last_candidate = max(first_candidate, n_valid - min_resp)
+
+    boundary_repr = (
+        _layer(h, 12)[valid_positions]
+        + _layer(h, 13)[valid_positions]
+    ) * 0.5
+    unit = boundary_repr / boundary_repr.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+    adjacent_cos = (unit[1:] * unit[:-1]).sum(dim=-1).clamp(-1.0, 1.0)
+    transition = 1.0 - adjacent_cos
+
+    norms = boundary_repr.norm(p=2, dim=-1)
+    norm_jump = (norms[1:] - norms[:-1]).abs() / norms[:-1].abs().clamp(min=1e-6)
+    transition_score = transition + 0.15 * norm_jump
+    transition_score = (
+        transition_score - transition_score.mean()
+    ) / transition_score.std(unbiased=False).clamp(min=1e-6)
+
+    candidate_starts = torch.arange(
+        first_candidate,
+        last_candidate + 1,
+        device=h.device,
+        dtype=torch.long,
+    )
+    response_fraction = (n_valid - candidate_starts).to(dtype=h.dtype) / float(n_valid)
+    prior_penalty = 0.65 * (response_fraction - 0.35).abs()
+
+    candidate_scores = transition_score[candidate_starts - 1] - prior_penalty
+    best_rel = int(candidate_scores.argmax().item())
+    best_start = int(candidate_starts[best_rel].item())
+    tail_start = valid_positions[best_start]
+    boundary_score = candidate_scores[best_rel].reshape(1)
 
     response_mask = mask & (torch.arange(mask.numel(), device=mask.device) >= tail_start)
     context_mask = mask & ~response_mask
     if not bool(context_mask.any().item()):
         context_mask = response_mask
-    return response_mask, context_mask
+    return response_mask, context_mask, boundary_score
 
 
 def aggregate(
@@ -176,7 +224,7 @@ def aggregate(
     ``0`` embeddings, ``1…L`` outputs after transformer blocks ``1…L`` (here L = 24).
 
     Block A is a compact geometric/statistical summary over layers 10-19.
-    Block B is semantic response-tail pooling from two fused mid-late layers. For
+    Block B is semantic response-only pooling from two factual mid layers. For
     Qwen-0.5B this yields 66 + 2 * 896 = 1858 features.
     """
     h = hidden_states.float()
@@ -191,7 +239,7 @@ def aggregate(
             device=h.device,
         )
 
-    response_mask, context_mask = _response_and_context_masks(mask)
+    response_mask, context_mask, boundary_score = _response_and_context_masks(h, mask)
     n_valid = mask.float().sum().clamp(min=1.0)
     n_response = response_mask.float().sum().clamp(min=1.0)
     seq_len = torch.tensor(mask.numel(), dtype=h.dtype, device=h.device).clamp(min=1.0)
@@ -204,7 +252,7 @@ def aggregate(
         (n_response / n_valid).reshape(1),
         torch.log(n_response + 1.0).reshape(1),
         torch.log(n_valid / seq_len + 1e-6).reshape(1),
-        torch.log(n_valid + 1.0).reshape(1),
+        boundary_score,
     ]
 
     for layer_idx in stat_layers:
@@ -252,10 +300,10 @@ def aggregate(
 
     geom_features = torch.cat(geom, dim=0)
 
-    semantic_mid = _masked_mean(_layer(h, 16), response_mask)
-    semantic_late = _masked_mean(_layer(h, 19), response_mask)
-    semantic_fused = torch.maximum(semantic_mid, semantic_late)
-    semantic = [semantic_late, semantic_fused]
+    semantic = [
+        _masked_mean(_layer(h, 12), response_mask),
+        _masked_mean(_layer(h, 13), response_mask),
+    ]
 
     return torch.cat([geom_features, *semantic], dim=0)
 
