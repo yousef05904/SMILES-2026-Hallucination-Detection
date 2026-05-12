@@ -27,7 +27,7 @@ def _stub_model_maybe() -> None:
         return
 
     try:
-        import torch  # defer until env opt-in avoids torch import quirks in odd envs
+        import torch
 
         tokenizer_mod = sys.modules.setdefault(
             "transformers", __import__("transformers")
@@ -61,11 +61,11 @@ def _stub_model_maybe() -> None:
                 return {"input_ids": ids, "attention_mask": attn}
             raise NotImplementedError
 
-        def __getattr__(self, name):  # pad_token delegation
+        def __getattr__(self, name):
             return getattr(self.inner, name)
 
     class _StubCausalLM(torch.nn.Module):
-        def forward(self, input_ids, attention_mask=None, **_kwargs):  # type: ignore[no-untyped-def]
+        def forward(self, input_ids, attention_mask=None, **_kwargs):
             device = input_ids.device
             b, seq = input_ids.shape
             hid = 896
@@ -84,7 +84,7 @@ def _stub_model_maybe() -> None:
 
             return types.SimpleNamespace(hidden_states=tuple(stacks))
 
-    def _stub_get_model_and_tokenizer(model_name: str = "Qwen/Qwen2.5-0.5B"):  # noqa: ARG001
+    def _stub_get_model_and_tokenizer(model_name: str = "Qwen/Qwen2.5-0.5B"):
         tok_inner = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
 
         stub = _StubCausalLM()
@@ -104,12 +104,14 @@ import torch
 
 def _masked_mean(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
     """tensor: (seq, dim), mask_seq: (seq,) bool."""
+    mask_seq = mask_seq.to(device=tensor.device)
     w = mask_seq.float().unsqueeze(-1)
     denom = w.sum().clamp(min=1e-6)
     return (tensor * w).sum(dim=0) / denom
 
 
 def _masked_std(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
+    mask_seq = mask_seq.to(device=tensor.device)
     mu = _masked_mean(tensor, mask_seq)
     w = mask_seq.float().unsqueeze(-1)
     denom = w.sum().clamp(min=1e-6)
@@ -118,6 +120,7 @@ def _masked_std(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
 
 
 def _masked_max(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
+    mask_seq = mask_seq.to(device=tensor.device)
     neg_inf = torch.full_like(tensor, float("-inf"))
     m = mask_seq.unsqueeze(-1)
     out = torch.where(m, tensor, neg_inf).max(dim=0).values
@@ -135,7 +138,7 @@ def aggregate(
     ``0`` embeddings, ``1…L`` outputs after transformer blocks ``1…L`` (here L = 24).
     """
     h = hidden_states.float()
-    mask = attention_mask.reshape(-1).bool()
+    mask = attention_mask.reshape(-1).bool().to(device=h.device)
 
     real_count = int(mask.long().sum().item())
     if real_count == 0:
@@ -157,11 +160,7 @@ def aggregate(
 
     feats.append(_masked_std(h[-1], mask))
 
-    if h.size(0) >= 15:
-        earlier = -13
-    else:
-        earlier = 1
-
+    earlier = -13 if h.size(0) >= 15 else 1
     feats.append(h[-1, pos_last] - h[earlier, pos_last])
 
     last_vecs = [h[o, pos_last] for o in late]
@@ -188,9 +187,8 @@ def extract_geometric_features(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    del hidden_states
     del attention_mask
-    return torch.zeros(0)
+    return torch.zeros(0, dtype=hidden_states.dtype, device=hidden_states.device)
 
 
 def aggregation_and_feature_extraction(
