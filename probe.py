@@ -24,9 +24,9 @@ RNG_SEED = 42
 
 
 def _safe_pca_dim(n_samples: int, n_features: int) -> int:
-    """Choose a conservative PCA size from the training fold only."""
-    upper = min(n_features, max(1, n_samples - 2))
-    target = min(upper, max(8, n_samples // 5), 96)
+    """Keep enough principal components while staying inside fold rank."""
+    upper = min(n_features, max(1, n_samples - 1))
+    target = min(256, upper)
     return int(max(1, target))
 
 
@@ -46,7 +46,7 @@ def _build_estimator(n_samples: int, n_features: int) -> Pipeline:
                 "lr",
                 LogisticRegression(
                     solver="lbfgs",
-                    C=0.08,
+                    C=0.5,
                     max_iter=3000,
                     class_weight="balanced",
                     random_state=RNG_SEED,

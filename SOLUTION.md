@@ -60,9 +60,9 @@ Files modified (`aggregation.py`): look for **`_stub_model_maybe`** and **`SMILE
 
 | File | Role |
 |------|------|
-| `aggregation.py` | Late-layer pooled features (mean / max / last token), dispersion, cross-layer drift, norms, adjacent cosines, light length cues (`feature_dim ≈ 12 554`). Optional `SMILES_STUB_LM`. |
-| `probe.py` | `HallucinationProbe` subclasses `torch.nn.Module` per harness but delegates to **sklearn** `VotingClassifier`: PCA+logistic regression, PCA+HistGradientBoosting (early stopping), and ExtraTrees. Validation F1 selects the inference threshold (`fit_hyperparameters`). |
-| `splitting.py` | **Stratified 5-fold** outer evaluation; stratified validation slice (~18 %) carved from outer training folds for threshold tuning. |
+| `aggregation.py` | Balanced late-layer features: last 4 transformer layers, each with masked mean pooling plus the last valid token representation (`feature_dim ≈ 7,168` for Qwen-0.5B). Optional `SMILES_STUB_LM`. |
+| `probe.py` | `HallucinationProbe` subclasses `torch.nn.Module` per harness but delegates to a deterministic **sklearn** pipeline: `StandardScaler` → `PCA` → balanced `LogisticRegression`. Validation accuracy, with F1 as tie-breaker, selects the inference threshold (`fit_hyperparameters`). |
+| `splitting.py` | **Stratified 5-fold** outer evaluation; deterministic stratified validation folds for threshold tuning, with prompt grouping only when it remains fold-stable. |
 
 Infrastructure left unchanged: **`model.py`**, **`evaluate.py`**, **`solution.py`**, data.
 
@@ -72,25 +72,28 @@ Infrastructure left unchanged: **`model.py`**, **`evaluate.py`**, **`solution.py
 
 ### Aggregation
 
-Baseline code used only **last-layer, last-real-token**. I pooled the **four deepest transformer stacks** (−4…−1) with **masked mean/max** plus **last token**, stacked **masked std on the deepest layer**, a **difference** between deepest and earlier depth (−13 when available), **L2 norms** along the trajectory, **log(norm ratio)** deepest vs earliest of the quartet, pairwise **cosine similarities** across adjacent depths on the answer’s last visible token, and two **effective-length ratios** scaled by `MAX_LENGTH` (fixed to 512 upstream). Padding is stripped via the attention mask; geometry lives in pooled directions rather than padding noise.
+The final extractor uses the **four deepest transformer stacks** (`-4...-1`). For each selected layer it concatenates:
 
-Motivation: hallucination manifests as layer-wise sharpening or inconsistency versus truth; mixing pooling heads increases robustness versus a single slicing point while keeping tensors vectorized.
+- masked mean pooling over valid, non-padding tokens
+- the last valid token representation
+
+It deliberately excludes max pooling, std pooling, cosine chains, norm ratios, length cues, and large geometric expansion. Padding is stripped with the attention mask moved to the hidden-state device, so the same code path works on CPU, CUDA, and Colab GPU.
+
+Motivation: Version A (`feature_dim = 12,554`) had useful late-layer signal but overfit. Version B (`feature_dim = 2,688`) removed too much signal and underfit. The final design keeps answer-ending signal plus global answer/context signal from late layers while staying materially smaller than the overfit version.
 
 ### Probe
 
-Torch MLP probes overfit aggressively on **`N≈689` × `dim≈1.25e4`.** sklearn gives transparent regularization paths:
+The probe is a single regularized sklearn pipeline:
 
-- PCA caps rank with **randomized SVD**, sized from sample count versus feature count.
-- `LogisticRegression(lbfgs, class_weight=balanced)` anchors low-variance discriminants.
-- `ExtraTrees` handles nonlinear thresholding with `sqrt` subsampling and imbalance-aware weighting modes.
-- `HistGradientBoosting` captures residual curvature with **built-in validation early stopping**.
-- Weighted voting blends these opinions; softmax probabilities feed **AUROC** and threshold search.
+- `StandardScaler`
+- randomized `PCA`, capped at `min(256, n_samples - 1, n_features)`
+- `LogisticRegression(lbfgs, C=0.5, class_weight="balanced")`
 
-Why not heavier deep nets inside the harness? Tabular ensembles with calibrated probability outputs trained under cross-validation fit the available labels without fragile hyperparameter choreography.
+Why not a larger ensemble? The real run showed a high-capacity feature/probe combination can memorize the folds. A single PCA logistic model keeps enough rank for the restored 7k-dimensional features while regularizing the final decision boundary.
 
 ### Splitting
 
-Stratified K-fold aligns with the leaderboard’s reliance on estimating generalization variance under class skew (~483 positive / ~206 negative). Nested validation shards avoid peeking calibration thresholds from the locked-outfold test mass.
+Stratified K-fold aligns with the leaderboard’s reliance on estimating generalization variance under class skew. Nested validation shards avoid peeking calibration thresholds from the locked-out fold test mass. Prompt-level grouping is used only when repeated prompts are sufficiently numerous and balanced; otherwise the splitter falls back to normal `StratifiedKFold` to avoid unstable validation/test class balance.
 
 ---
 
@@ -98,21 +101,21 @@ Stratified K-fold aligns with the leaderboard’s reliance on estimating general
 
 | Idea | Outcome |
 |------|---------|
-| Last-token-only stacking | Competitive but clearly weaker than pooled multi-head late layers alone in earlier scratch runs. |
-| Pure torch MLP (starter) | Stable but brittle on high-dimensional pooled vectors with small N compared to ensembles + PCA branches. |
-| Sample-weight propagation through Voting / Pipeline sklearn 1.x | Routed metadata flags changed across versions; standardized on class imbalance inside base estimators to keep `fit()` portable. |
+| Large pooled/geometric feature set (`feature_dim = 12,554`) | Real Colab run produced high train metrics but weaker validation/test metrics, indicating overfitting. |
+| Mean-only compact extractor (`feature_dim = 2,688`) | Real Colab run underfit and lost too much discriminative signal. |
+| Heavy ensemble probe | Avoided in the final version because the dataset is small and the goal is stable generalization rather than train accuracy. |
 
 ---
 
 ## Metrics (official harness)
 
-Interpret **primary competition accuracy** via your own **`results.json`** `avg_test_accuracy` after **full** LM extraction ( **`SMILES_STUB_LM` unset** ).
+Interpret **primary competition accuracy** via your own **`results.json`** `avg_test_accuracy` after **full** LM extraction ( **`SMILES_STUB_LM` unset** ). Final balanced-method metrics should be filled in only after the real Colab GPU run.
 
 Representative **`evaluate.py`** fields I track during development:
 
 | Quantity | Typical purpose |
 |-----------|----------------|
-| Majority baseline | Sanity floor (~70 % accuracy on skewed negatives of prevalence). |
+| Majority baseline | Sanity floor for accuracy under class imbalance. |
 | Train vs val gap | Probe capacity / overfitting readout after folds. |
 | Test accuracy / AUROC | Primary / diagnostic external generalization summaries averaged over folds |
 

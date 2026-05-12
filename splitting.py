@@ -31,17 +31,15 @@ def _make_groups(y: np.ndarray, df: pd.DataFrame | None) -> np.ndarray:
 def _safe_n_splits(
     y: np.ndarray,
     requested: int,
-    groups: np.ndarray | None = None,
 ) -> int:
     _, counts = np.unique(y, return_counts=True)
-    group_limit = np.unique(groups).size if groups is not None else len(y)
     if counts.size < 2:
-        return int(max(2, min(requested, group_limit)))
-    return int(max(2, min(requested, counts.min(), group_limit)))
+        return 2
+    return int(max(2, min(requested, counts.min())))
 
 
 def _splitter(y: np.ndarray, groups: np.ndarray, n_splits: int, random_state: int):
-    if np.unique(groups).size < len(groups):
+    if _should_group_split(y, groups, n_splits):
         return StratifiedGroupKFold(
             n_splits=n_splits,
             shuffle=True,
@@ -55,6 +53,30 @@ def _splitter(y: np.ndarray, groups: np.ndarray, n_splits: int, random_state: in
     ).split(np.zeros(len(y), dtype=np.int64), y)
 
 
+def _should_group_split(y: np.ndarray, groups: np.ndarray, n_splits: int) -> bool:
+    """Use group folds only when repeated groups are numerous and well balanced."""
+    unique_groups, group_inverse, group_counts = np.unique(
+        groups, return_inverse=True, return_counts=True
+    )
+    if unique_groups.size == len(groups):
+        return False
+
+    if unique_groups.size < n_splits:
+        return False
+
+    # A very large prompt group can destabilize fold balance more than it helps.
+    if group_counts.max() > max(2, len(y) // n_splits):
+        return False
+
+    labels = np.unique(y)
+    for label in labels:
+        label_group_count = np.unique(group_inverse[y == label]).size
+        if label_group_count < n_splits:
+            return False
+
+    return True
+
+
 def split_data(
     y: np.ndarray,
     df: pd.DataFrame | None = None,
@@ -64,12 +86,12 @@ def split_data(
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
     """Deterministic stratified folds with leak-safe validation.
 
-    When ``df`` contains prompt text, repeated prompts are kept in the same group
-    across the outer test split and inner validation split.
+    When prompt grouping is sufficiently balanced, repeated prompts are kept in
+    the same group. Otherwise the function falls back to normal stratified folds.
     """
     y = np.asarray(y)
     groups = _make_groups(y, df)
-    outer_splits = _safe_n_splits(y, n_splits, groups)
+    outer_splits = _safe_n_splits(y, n_splits)
 
     splits: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]] = []
 
@@ -79,7 +101,7 @@ def split_data(
         y_outer = y[idx_train_full]
         groups_outer = groups[idx_train_full]
         inner_requested = max(2, round(1.0 / val_size))
-        inner_splits = _safe_n_splits(y_outer, inner_requested, groups_outer)
+        inner_splits = _safe_n_splits(y_outer, inner_requested)
 
         inner_iter = _splitter(
             y_outer,

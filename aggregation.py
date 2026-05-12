@@ -110,30 +110,40 @@ def _masked_mean(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
     return (tensor * w).sum(dim=0) / denom
 
 
+def _last_valid_token(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
+    """Return the representation of the final non-padding token."""
+    mask_seq = mask_seq.to(device=tensor.device)
+    valid_positions = torch.nonzero(mask_seq, as_tuple=False).squeeze(-1)
+    return tensor[valid_positions[-1]]
+
+
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Compact late-layer mean-pooled representation.
+    """Balanced late-layer mean + last-token representation.
 
     Layer index convention (Hugging Face causal LMs):
 
     ``0`` embeddings, ``1…L`` outputs after transformer blocks ``1…L`` (here L = 24).
 
-    The previous feature set mixed several pooling modes and cross-layer geometry,
-    producing >12k dimensions for Qwen-0.5B.  For this small dataset we keep only
-    mean-pooled hidden states from the final few transformer layers, which should
-    yield 3 * hidden_size features (2688 for Qwen-0.5B).
+    This keeps the most useful late-layer signal from the overfit high-dimensional
+    version while avoiding max/std pooling and cross-layer geometry. For Qwen-0.5B
+    it yields 4 layers * 2 pooling methods * 896 hidden dims = 7168 features.
     """
     h = hidden_states.float()
     mask = attention_mask.reshape(-1).bool().to(device=h.device)
 
     real_count = int(mask.long().sum().item())
     if real_count == 0:
-        return torch.zeros(h.size(-1) * 3, dtype=h.dtype, device=h.device)
+        return torch.zeros(h.size(-1) * 8, dtype=h.dtype, device=h.device)
 
-    late = (-3, -2, -1)
-    feats = [_masked_mean(h[layer_idx], mask) for layer_idx in late]
+    late = (-4, -3, -2, -1)
+    feats: list[torch.Tensor] = []
+    for layer_idx in late:
+        layer = h[layer_idx]
+        feats.append(_masked_mean(layer, mask))
+        feats.append(_last_valid_token(layer, mask))
 
     return torch.cat(feats, dim=0)
 
