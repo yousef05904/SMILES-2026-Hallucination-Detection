@@ -110,75 +110,30 @@ def _masked_mean(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
     return (tensor * w).sum(dim=0) / denom
 
 
-def _masked_std(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
-    mask_seq = mask_seq.to(device=tensor.device)
-    mu = _masked_mean(tensor, mask_seq)
-    w = mask_seq.float().unsqueeze(-1)
-    denom = w.sum().clamp(min=1e-6)
-    var = (((tensor - mu) ** 2) * w).sum(dim=0) / denom
-    return var.sqrt()
-
-
-def _masked_max(tensor: torch.Tensor, mask_seq: torch.Tensor) -> torch.Tensor:
-    mask_seq = mask_seq.to(device=tensor.device)
-    neg_inf = torch.full_like(tensor, float("-inf"))
-    m = mask_seq.unsqueeze(-1)
-    out = torch.where(m, tensor, neg_inf).max(dim=0).values
-    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Late-layer pooled states + dispersion, drift, and lightweight geometry.
+    """Compact late-layer mean-pooled representation.
 
     Layer index convention (Hugging Face causal LMs):
 
     ``0`` embeddings, ``1…L`` outputs after transformer blocks ``1…L`` (here L = 24).
+
+    The previous feature set mixed several pooling modes and cross-layer geometry,
+    producing >12k dimensions for Qwen-0.5B.  For this small dataset we keep only
+    mean-pooled hidden states from the final few transformer layers, which should
+    yield 3 * hidden_size features (2688 for Qwen-0.5B).
     """
     h = hidden_states.float()
     mask = attention_mask.reshape(-1).bool().to(device=h.device)
 
     real_count = int(mask.long().sum().item())
     if real_count == 0:
-        return torch.zeros(0, dtype=h.dtype, device=h.device)
+        return torch.zeros(h.size(-1) * 3, dtype=h.dtype, device=h.device)
 
-    pos_real = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-    pos_last = int(pos_real[-1].item())
-    denom_seq = torch.tensor(mask.numel(), dtype=h.dtype, device=h.device)
-
-    late = (-4, -3, -2, -1)
-
-    feats: list[torch.Tensor] = []
-
-    for off in late:
-        hl = h[off]
-        feats.append(hl[pos_last])
-        feats.append(_masked_mean(hl, mask))
-        feats.append(_masked_max(hl, mask))
-
-    feats.append(_masked_std(h[-1], mask))
-
-    earlier = -13 if h.size(0) >= 15 else 1
-    feats.append(h[-1, pos_last] - h[earlier, pos_last])
-
-    last_vecs = [h[o, pos_last] for o in late]
-
-    norms = torch.stack([(v.norm(p=2) + 1e-12).unsqueeze(0) for v in last_vecs])
-    feats.append(norms.squeeze(-1))
-
-    feats.append((norms[-1] / norms[0].clamp(min=1e-12)).log())
-
-    for a, b in zip(last_vecs, last_vecs[1:]):
-        c = torch.nn.functional.cosine_similarity(
-            a.unsqueeze(0), b.unsqueeze(0), dim=1
-        )[0]
-        feats.append(c.unsqueeze(0))
-
-    n_real = mask.float().sum().clamp(min=1.0)
-    feats.append((n_real / 512.0).clamp(min=1e-6).log().reshape(1))
-    feats.append((n_real / denom_seq.clamp(min=1.0)).reshape(1))
+    late = (-3, -2, -1)
+    feats = [_masked_mean(h[layer_idx], mask) for layer_idx in late]
 
     return torch.cat(feats, dim=0)
 
