@@ -1,11 +1,11 @@
 """
 probe.py — Hallucination probe classifier (student-implemented).
 
-Implements ``HallucinationProbe``, a binary MLP that classifies feature
-vectors as truthful (0) or hallucinated (1).  Called from ``solution.py``
-via ``evaluate.run_evaluation``.  All four public methods (``fit``,
-``fit_hyperparameters``, ``predict``, ``predict_proba``) must be implemented
-and their signatures must not change.
+``HallucinationProbe`` subclasses ``torch.nn.Module`` for compatibility with
+the competition harness, while the discriminator itself is implemented with
+deterministic ``scikit-learn`` ensembles (tab-friendly for ~10k–dim features).
+
+Public API: ``fit``, ``fit_hyperparameters``, ``predict``, ``predict_proba``.
 """
 
 from __future__ import annotations
@@ -13,124 +13,149 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.decomposition import PCA
+from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    HistGradientBoostingClassifier,
+    VotingClassifier,
+)
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 
-class HallucinationProbe(nn.Module):
-    """Binary classifier that detects hallucinations from hidden-state features.
+RNG_SEED = 42
 
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
-    """
+
+def _safe_pca_dim(n_samples: int, n_features: int) -> int:
+    upper = min(n_features, max(1, n_samples - 2))
+    target = min(upper, max(12, n_samples // 4))
+    return int(max(8, min(target, 160)))
+
+
+def _build_estimator(n_samples: int, n_features: int) -> VotingClassifier:
+    pca_lr = _safe_pca_dim(n_samples, n_features)
+    pca_hgb = max(24, min(96, _safe_pca_dim(n_samples, n_features)))
+
+    lr_path = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "pca",
+                PCA(
+                    n_components=pca_lr,
+                    svd_solver="randomized",
+                    random_state=RNG_SEED,
+                ),
+            ),
+            (
+                "lr",
+                LogisticRegression(
+                    solver="lbfgs",
+                    C=1.5,
+                    max_iter=2400,
+                    class_weight="balanced",
+                    random_state=RNG_SEED,
+                ),
+            ),
+        ]
+    )
+
+    et = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "et",
+                ExtraTreesClassifier(
+                    n_estimators=220,
+                    max_depth=None,
+                    min_samples_leaf=2,
+                    max_features="sqrt",
+                    bootstrap=False,
+                    class_weight="balanced_subsample",
+                    random_state=RNG_SEED,
+                    n_jobs=1,
+                ),
+            ),
+        ]
+    )
+
+    hgbt = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "pca",
+                PCA(
+                    n_components=pca_hgb,
+                    svd_solver="randomized",
+                    random_state=RNG_SEED,
+                ),
+            ),
+            (
+                "hgb",
+                HistGradientBoostingClassifier(
+                    max_depth=6,
+                    max_iter=260,
+                    learning_rate=0.07,
+                    l2_regularization=1e-4,
+                    early_stopping=True,
+                    validation_fraction=0.12,
+                    n_iter_no_change=20,
+                    random_state=RNG_SEED,
+                ),
+            ),
+        ]
+    )
+
+    # ExtraTrees excels on heterogeneous nonlinearities; PCA+LR anchors linear
+    # structure; calibrated boosting via early stopping catches residual signal.
+    return VotingClassifier(
+        estimators=[
+            ("lr_pca", lr_path),
+            ("extra_trees", et),
+            ("hgbt_pc", hgbt),
+        ],
+        voting="soft",
+        weights=[1.45, 1.05, 1.0],
+        n_jobs=1,
+    )
+
+
+class HallucinationProbe(nn.Module):
+    """Sklearn-soft-voting ensemble behind a lightweight ``nn.Module`` shell."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
-        self._threshold: float = 0.5  # tuned by fit_hyperparameters()
-
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the network definition below.
-    # ------------------------------------------------------------------
-    def _build_network(self, input_dim: int) -> None:
-        """Instantiate the network layers.
-
-        Called once at the start of ``fit()`` when ``input_dim`` is known.
-
-        Args:
-            input_dim: Feature vector dimensionality.
-        """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
-
-    # ------------------------------------------------------------------
+        self._threshold: float = 0.5
+        self._model: VotingClassifier | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
-
-        Args:
-            x: Float tensor of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
-        """
-        if self._net is None:
-            raise RuntimeError(
-                "Network has not been built yet. Call fit() before forward()."
-            )
-        return self._net(x).squeeze(-1)
+        del x
+        raise RuntimeError(
+            "This probe routes inference through sklearn; use predict / predict_proba."
+        )
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the probe on labelled feature vectors.
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.int64)
 
-        Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-            y: Integer label vector of shape ``(n_samples,)``; 0 = truthful,
-               1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
-        X_scaled = self._scaler.fit_transform(X)
-
-        self._build_network(X_scaled.shape[1])
-
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
-
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
-        self.eval()
+        self._model = _build_estimator(X.shape[0], X.shape[1])
+        self._model.fit(X, y)
         return self
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
+        if self._model is None:
+            raise RuntimeError("Call fit before fit_hyperparameters.")
 
-        The chosen threshold is stored in ``self._threshold`` and used by
-        subsequent ``predict`` calls.  Call this after ``fit`` and before
-        ``predict``.
+        probs = self.predict_proba(np.asarray(X_val, dtype=np.float32))[:, 1]
+        y_val = np.asarray(y_val, dtype=np.int64)
 
-        Args:
-            X_val: Validation feature matrix of shape
-                   ``(n_val_samples, feature_dim)``.
-            y_val: Integer label vector of shape ``(n_val_samples,)``;
-                   0 = truthful, 1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
-        probs = self.predict_proba(X_val)[:, 1]
-
-        # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
+        candidates = np.unique(
+            np.concatenate([probs, np.linspace(0.0, 1.0, 101)])
+        )
 
         best_threshold = 0.5
         best_f1 = -1.0
@@ -145,34 +170,11 @@ class HallucinationProbe(nn.Module):
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict binary labels for feature vectors.
-
-        Uses the decision threshold in ``self._threshold`` (default ``0.5``;
-        updated by ``fit_hyperparameters``).
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Integer array of shape ``(n_samples,)`` with values in ``{0, 1}``.
-        """
         return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return class probability estimates.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Array of shape ``(n_samples, 2)`` where column 1 contains the
-            estimated probability of the hallucinated class (label 1).
-            Used to compute AUROC.
-        """
-        X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
-        return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-
+        if self._model is None:
+            raise RuntimeError("Probe is not fitted.")
+        X = np.asarray(X, dtype=np.float32)
+        proba = self._model.predict_proba(X)
+        return proba.astype(np.float64)
