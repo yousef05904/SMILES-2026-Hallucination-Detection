@@ -60,8 +60,8 @@ Files modified (`aggregation.py`): look for **`_stub_model_maybe`** and **`SMILE
 
 | File | Role |
 |------|------|
-| `aggregation.py` | Minimal clean features: selected mid-late transformer layers `[-8, -4, -1]`, each with masked mean pooling only (`feature_dim ≈ 2,688` for Qwen-0.5B). Optional `SMILES_STUB_LM`. |
-| `probe.py` | `HallucinationProbe` subclasses `torch.nn.Module` per harness but delegates to a deterministic **sklearn** pipeline: `StandardScaler` → balanced `LogisticRegression`. Validation accuracy, with F1 and prediction balance as tie-breakers, selects the inference threshold (`fit_hyperparameters`). |
+| `aggregation.py` | Compact hybrid features from layers `10-19`: 66 geometric/statistical trajectory scalars plus two 896-d semantic response-tail vectors (`feature_dim ≈ 1,858` for Qwen-0.5B). Optional `SMILES_STUB_LM`. |
+| `probe.py` | `HallucinationProbe` subclasses `torch.nn.Module` per harness but delegates to a deterministic block-wise **sklearn** pipeline: robust-scaled geometry, standardized semantic PCA, Platt-calibrated logistic regression, and validation accuracy threshold tuning. |
 | `splitting.py` | **Stratified 5-fold** outer evaluation; deterministic stratified validation slice from the outer training pool for threshold tuning. |
 
 Infrastructure left unchanged: **`model.py`**, **`evaluate.py`**, **`solution.py`**, data.
@@ -72,22 +72,28 @@ Infrastructure left unchanged: **`model.py`**, **`evaluate.py`**, **`solution.py
 
 ### Aggregation
 
-The final extractor uses three selected transformer stacks: **`-8`**, **`-4`**, and **`-1`**. For each selected layer it uses:
+The final extractor uses only middle-to-late transformer layers in the **`10-19`** range.
 
-- masked mean pooling over valid, non-padding tokens
+It builds two compact blocks:
 
-It deliberately excludes last-token concatenation, max pooling, std pooling, cosine chains, norm ratios, length cues, and large geometric expansion. Padding is stripped with the attention mask moved to the hidden-state device, so the same code path works on CPU, CUDA, and Colab GPU.
+- **Geometric block (`66` dims):** response/context norm statistics, response-context cosine contrast, inter-layer cosine trajectory, drift magnitudes, response length signals, and small trajectory-stability summaries.
+- **Semantic block (`1,792` dims):** response-tail mean pooling from layer `19` plus a max-fused layer `16/19` representation.
 
-Motivation: huge feature versions (`feature_dim = 12,554...17,943`) overfit or underperformed, while a last-three-layer mean-only variant was too weak in our run. The selected-layer version keeps the feature count low (`2,688`) but samples a wider mid-late model trajectory instead of using only adjacent final layers.
+It deliberately excludes large hidden-state concatenations, max/std raw expansion, topological features, tree-style hand-crafted grids, and heavy last-token pooling. Padding is stripped with the attention mask moved to the hidden-state device, so the same code path works on CPU, CUDA, and Colab GPU.
+
+Motivation: the stable `1,824`-feature version generalized reasonably but lacked enough trajectory structure. This version keeps nearly the same compact size while adding orthogonal geometric signals for confidence stability, retrieval strength, and semantic smoothness.
 
 ### Probe
 
 The probe is a single regularized sklearn pipeline:
 
-- `StandardScaler`
-- `LogisticRegression(lbfgs, C=0.2, class_weight="balanced")`
+- geometry: `RobustScaler`
+- semantic vectors: `StandardScaler` then randomized `PCA(n_components=48)`
+- classifier: `LogisticRegression(lbfgs, C=0.03)` without class weighting
+- calibration: internal Platt scaling split inside `fit()`
+- thresholding: validation accuracy first, F1 and prediction balance as tie-breakers
 
-Why not PCA or a larger ensemble? At `2,688` dimensions, the feature space is small enough for a directly regularized linear probe. Avoiding PCA preserves the selected layer coordinates, while the stronger L2 penalty keeps train accuracy from drifting toward memorization.
+Why not a larger ensemble? The real runs showed that high-capacity probes chase train accuracy without reliable fold gains. PCA on the semantic block compresses the latent representation, while the geometric scalars remain directly available to the final linear classifier.
 
 ### Splitting
 
@@ -102,13 +108,14 @@ Stratified K-fold aligns with the leaderboard’s reliance on estimating general
 | Large pooled/geometric feature set (`feature_dim = 12,554`) | Real Colab run produced high train metrics but weaker validation/test metrics, indicating overfitting. |
 | Even larger feature variants (`feature_dim ≈ 17,943`) | Added complexity without reliable generalization gains. |
 | Adjacent last-three-layer mean extractor (`feature_dim = 2,688`) | Real Colab run underfit in our implementation, so the final version keeps the same dimensionality but spreads layers across `-8`, `-4`, and `-1`. |
+| Stable compact hybrid (`feature_dim = 1,824`) | Improved generalization but plateaued below the strongest known AUROC, motivating a richer geometric block. |
 | Heavy ensemble or tree probes | Avoided in the final version because the dataset is small and the goal is stable 5-fold generalization rather than train accuracy. |
 
 ---
 
 ## Metrics (official harness)
 
-Interpret **primary competition accuracy** via your own **`results.json`** `avg_test_accuracy` after **full** LM extraction ( **`SMILES_STUB_LM` unset** ). Final minimal-clean metrics should be filled in only after the real Colab GPU run.
+Interpret **primary competition accuracy** via your own **`results.json`** `avg_test_accuracy` after **full** LM extraction ( **`SMILES_STUB_LM` unset** ). Final compact-fusion metrics should be filled in only after the real Colab GPU run.
 
 Representative **`evaluate.py`** fields I track during development:
 

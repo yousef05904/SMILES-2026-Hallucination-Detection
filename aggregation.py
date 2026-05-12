@@ -102,7 +102,7 @@ _stub_model_maybe()
 import torch
 
 
-GEOMETRIC_FEATURE_DIM = 32
+GEOMETRIC_FEATURE_DIM = 66
 SEMANTIC_LAYER_COUNT = 2
 
 
@@ -175,9 +175,9 @@ def aggregate(
 
     ``0`` embeddings, ``1…L`` outputs after transformer blocks ``1…L`` (here L = 24).
 
-    Block A is a small geometric/statistical summary over layers around 9-18.
-    Block B is semantic response-tail mean pooling from two strong layers. For
-    Qwen-0.5B this yields 32 + 2 * 896 = 1824 features.
+    Block A is a compact geometric/statistical summary over layers 10-19.
+    Block B is semantic response-tail pooling from two fused mid-late layers. For
+    Qwen-0.5B this yields 66 + 2 * 896 = 1858 features.
     """
     h = hidden_states.float()
     mask = attention_mask.reshape(-1).bool().to(device=h.device)
@@ -196,13 +196,15 @@ def aggregate(
     n_response = response_mask.float().sum().clamp(min=1.0)
     seq_len = torch.tensor(mask.numel(), dtype=h.dtype, device=h.device).clamp(min=1.0)
 
-    stat_layers = [9, 12, 15, 18]
+    stat_layers = [10, 12, 14, 16, 18, 19]
     response_means: list[torch.Tensor] = []
-    context_means: list[torch.Tensor] = []
+    response_norm_means: list[torch.Tensor] = []
     geom: list[torch.Tensor] = [
         (n_valid / seq_len).reshape(1),
         (n_response / n_valid).reshape(1),
+        torch.log(n_response + 1.0).reshape(1),
         torch.log(n_valid / seq_len + 1e-6).reshape(1),
+        torch.log(n_valid + 1.0).reshape(1),
     ]
 
     for layer_idx in stat_layers:
@@ -210,32 +212,50 @@ def aggregate(
         resp_mean = _masked_mean(layer, response_mask)
         ctx_mean = _masked_mean(layer, context_mask)
         response_means.append(resp_mean)
-        context_means.append(ctx_mean)
 
         norms = layer.norm(p=2, dim=-1)
-        geom.append(_masked_scalar_mean(norms, response_mask))
+        resp_norm_mean = _masked_scalar_mean(norms, response_mask)
+        ctx_norm_mean = _masked_scalar_mean(norms, context_mask)
+        response_norm_means.append(resp_norm_mean)
+        geom.append(resp_norm_mean)
         geom.append(_masked_scalar_std(norms, response_mask))
-        geom.append(_masked_scalar_mean(norms, context_mask))
+        geom.append(ctx_norm_mean)
+        geom.append(((resp_norm_mean - ctx_norm_mean) / (ctx_norm_mean.abs() + 1e-6)).reshape(1))
         geom.append(_cosine(resp_mean, ctx_mean))
         geom.append(_masked_variance_mean(layer, response_mask))
 
     scale = hidden_dim**0.5
+    adjacent_cosines: list[torch.Tensor] = []
+    drift_norms: list[torch.Tensor] = []
     for left, right in zip(response_means, response_means[1:]):
         drift = right - left
-        geom.append(_cosine(left, right))
-        geom.append((drift.norm(p=2) / scale).reshape(1))
+        adjacent_cos = _cosine(left, right)
+        drift_norm = (drift.norm(p=2) / scale).reshape(1)
+        adjacent_cosines.append(adjacent_cos)
+        drift_norms.append(drift_norm)
+        geom.append(adjacent_cos)
+        geom.append(drift_norm)
+        geom.append(drift.abs().mean().reshape(1))
 
     final_resp = response_means[-1]
     for prev in response_means[:-1]:
         geom.append(_cosine(prev, final_resp))
 
+    norm_series = torch.cat(response_norm_means, dim=0)
+    adjacent_series = torch.cat(adjacent_cosines, dim=0)
+    drift_series = torch.cat(drift_norms, dim=0)
+    geom.append(adjacent_series.mean().reshape(1))
+    geom.append(adjacent_series.var(unbiased=False).reshape(1))
+    geom.append(drift_series.mean().reshape(1))
+    geom.append(drift_series.var(unbiased=False).reshape(1))
+    geom.append(norm_series.var(unbiased=False).reshape(1))
+
     geom_features = torch.cat(geom, dim=0)
 
-    semantic_layers = [13, 18]
-    semantic = [
-        _masked_mean(_layer(h, layer_idx), response_mask)
-        for layer_idx in semantic_layers
-    ]
+    semantic_mid = _masked_mean(_layer(h, 16), response_mask)
+    semantic_late = _masked_mean(_layer(h, 19), response_mask)
+    semantic_fused = torch.maximum(semantic_mid, semantic_late)
+    semantic = [semantic_late, semantic_fused]
 
     return torch.cat([geom_features, *semantic], dim=0)
 
